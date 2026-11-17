@@ -280,7 +280,7 @@ ensure_sharded_fanout(Topic) ->
     true = ets:lookup(vmq_trie_subs, Key) =:= [{Key, fanout}],
     Shards = lists:usort([
         Shard
-     || {{Shard, EntryKey}, _Val} <- ets:tab2list(vmq_trie_subs_fanout),
+     || {{EntryKey, Shard, _SubscriberId}, _Val} <- ets:tab2list(vmq_trie_subs_fanout),
         EntryKey =:= Key
     ]),
     true = length(Shards) > 1,

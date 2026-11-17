@@ -169,7 +169,7 @@ fold_local(Key, SubscriberId, FoldFun, Acc) ->
     end.
 
 fold_fanout_shard(Shard, Key, SubscriberId, FoldFun, Acc) ->
-    fold__(FoldFun, SubscriberId, Acc, ets:lookup(vmq_trie_subs_fanout, {Shard, Key})).
+    fold__(FoldFun, SubscriberId, Acc, fanout_shard_entries(Shard, Key)).
 
 fold__(FoldFun, SubscriberId, Acc, [{_, SubsIdQoS} | Rest]) ->
     fold__(FoldFun, SubscriberId, FoldFun(SubsIdQoS, SubscriberId, Acc), Rest);
@@ -233,7 +233,11 @@ create_tables() ->
     _ = ets:new(vmq_trie_node, [{keypos, 2} | DefaultETSOpts]),
     _ = ets:new(vmq_trie_topic, [{keypos, 1} | DefaultETSOpts]),
     _ = ets:new(vmq_trie_subs, [bag | DefaultETSOpts]),
-    _ = ets:new(vmq_trie_subs_fanout, [bag | DefaultETSOpts]),
+    %% One row per subscriber and topic, ordered by {Key, Shard, SubscriberId}.
+    %% Rows of a topic are adjacent, and within a topic rows of a shard are adjacent,
+    %% so a single subscriber is found/removed in O(log N) and the rows of one topic
+    %% (or of one shard of a topic) are read with a key-prefix select.
+    _ = ets:new(vmq_trie_subs_fanout, [ordered_set | DefaultETSOpts]),
     _ = ets:new(vmq_trie_remote_subs, [{keypos, 1} | DefaultETSOpts]).
 
 %%--------------------------------------------------------------------
@@ -625,28 +629,38 @@ insert_trie_subs(Key, Val) ->
             %% duplicate - do nothing;
             false;
         [{Key, fanout}] ->
-            FanoutEntry = fanout_entry(Key, Val),
-            case
-                lists:member(
-                    FanoutEntry,
-                    ets:lookup(vmq_trie_subs_fanout, element(1, FanoutEntry))
-                )
-            of
+            insert_fanout(Key, Val);
+        [{Key, OtherVal} = E1] ->
+            case val_subscriber_id(OtherVal) =:= val_subscriber_id(Val) of
                 true ->
+                    %% same subscriber, changed value (e.g. QoS or queue pid):
+                    %% a subscriber has one subscription per topic, so replace it.
+                    ets:delete_object(vmq_trie_subs, E1),
+                    ets:insert(vmq_trie_subs, E),
                     false;
                 false ->
-                    ets:insert(vmq_trie_subs_fanout, FanoutEntry),
+                    %% fanout - move to fanout table
+                    ets:delete(vmq_trie_subs, Key),
+                    ets:insert(vmq_trie_subs, {Key, fanout}),
+                    ets:insert(vmq_trie_subs_fanout, fanout_entry(Key, Val)),
+                    ets:insert(vmq_trie_subs_fanout, fanout_entry(Key, OtherVal)),
                     true
-            end;
-        [E1] ->
-            %% fanout - move to fanout table
-            ets:delete(vmq_trie_subs, Key),
-            ets:insert(vmq_trie_subs, {Key, fanout}),
-            ets:insert(vmq_trie_subs_fanout, fanout_entry(Key, Val)),
-            ets:insert(vmq_trie_subs_fanout, fanout_entry(E1)),
+            end
+    end.
+insert_fanout(Key, Val) ->
+    {FanoutKey, _} = FanoutEntry = fanout_entry(Key, Val),
+    case ets:lookup(vmq_trie_subs_fanout, FanoutKey) of
+        [FanoutEntry] ->
+            %% duplicate - do nothing
+            false;
+        [_] ->
+            %% same subscriber, changed value: replace, the subscription count is unchanged
+            ets:insert(vmq_trie_subs_fanout, FanoutEntry),
+            false;
+        [] ->
+            ets:insert(vmq_trie_subs_fanout, FanoutEntry),
             true
     end.
-
 del_subscriber_group(MP, Node, Group, Topic, SubscriberId, QoS) ->
     Key = {MP, Group, Node, Topic},
     Val = {Node, Group, SubscriberId, QoS},
@@ -658,19 +672,14 @@ del_trie_subs(Key, Val) ->
             %% do nothing
             false;
         [{Key, fanout}] ->
-            FanoutEntry = fanout_entry(Key, Val),
-            case
-                lists:member(
-                    FanoutEntry,
-                    ets:lookup(vmq_trie_subs_fanout, element(1, FanoutEntry))
-                )
-            of
-                false ->
-                    false;
-                true ->
-                    ets:delete_object(vmq_trie_subs_fanout, FanoutEntry),
+            {FanoutKey, _} = FanoutEntry = fanout_entry(Key, Val),
+            case ets:lookup(vmq_trie_subs_fanout, FanoutKey) of
+                [FanoutEntry] ->
+                    ets:delete(vmq_trie_subs_fanout, FanoutKey),
                     maybe_compact_fanout(Key),
-                    true
+                    true;
+                _ ->
+                    false
             end;
         [{Key, Val}] ->
             ets:delete(vmq_trie_subs, Key),
@@ -717,19 +726,20 @@ del_local_trie_sub(Key, SubscriberId, QoS) ->
         [] ->
             false;
         [{Key, fanout}] ->
-            case
-                [
-                    E
-                 || {_FanoutKey, Val} = E <- fanout_entries(Key),
-                    same_local_sub(Val, SubscriberId, QoS)
-                ]
-            of
+            %% The subscriber's row is addressed directly by its key.
+            FanoutKey = fanout_key(Key, SubscriberId),
+            case ets:lookup(vmq_trie_subs_fanout, FanoutKey) of
+                [{_, Val}] ->
+                    case same_local_sub(Val, SubscriberId, QoS) of
+                        true ->
+                            ets:delete(vmq_trie_subs_fanout, FanoutKey),
+                            maybe_compact_fanout(Key),
+                            true;
+                        false ->
+                            false
+                    end;
                 [] ->
-                    false;
-                [FanoutEntry | _] ->
-                    ets:delete_object(vmq_trie_subs_fanout, FanoutEntry),
-                    maybe_compact_fanout(Key),
-                    true
+                    false
             end;
         [{Key, Val}] ->
             case same_local_sub(Val, SubscriberId, QoS) of
@@ -797,9 +807,10 @@ subinfo_qos(Other) ->
     Other.
 
 maybe_compact_fanout(Key) ->
-    case fanout_entries(Key) of
-        [E] ->
-            ets:delete_object(vmq_trie_subs_fanout, fanout_entry(E)),
+    %% Only needs to know whether 0, 1 or more entries are left.
+    case fanout_entries_upto(Key, 2) of
+        [{FanoutKey, _Val} = E] ->
+            ets:delete(vmq_trie_subs_fanout, FanoutKey),
             ets:delete_object(vmq_trie_subs, {Key, fanout}),
             ets:insert(vmq_trie_subs, plain_entry(Key, E));
         [_, _ | _] ->
@@ -807,7 +818,6 @@ maybe_compact_fanout(Key) ->
         [] ->
             ets:delete_object(vmq_trie_subs, {Key, fanout})
     end.
-
 configured_fanout_shard_count() ->
     case application:get_env(vmq_server, fanout_shard_count, 1) of
         Count when is_integer(Count), Count > 0 -> Count;
@@ -824,33 +834,32 @@ fanout_shard(SubscriberId) ->
     erlang:phash2(SubscriberId, fanout_shard_count()).
 
 fanout_key(Key, SubscriberId) ->
-    {fanout_shard(SubscriberId), Key}.
+    {Key, fanout_shard(SubscriberId), SubscriberId}.
 
-fanout_entry({{Shard, Key}, Val}) when is_integer(Shard) ->
-    {{Shard, Key}, Val};
-fanout_entry({Key, Val}) ->
-    fanout_entry(Key, Val).
+val_subscriber_id({SubscriberId, _QoS}) -> SubscriberId;
+val_subscriber_id({SubscriberId, _QoS, _QPid}) -> SubscriberId;
+val_subscriber_id({_Node, _Group, SubscriberId, _QoS}) -> SubscriberId.
 
-fanout_entry(Key, {SubscriberId, _QoS} = Val) ->
-    {fanout_key(Key, SubscriberId), Val};
-fanout_entry(Key, {SubscriberId, _QoS, _QPid} = Val) ->
-    {fanout_key(Key, SubscriberId), Val};
-fanout_entry(Key, {_Node, _Group, SubscriberId, _QoS} = Val) ->
-    {fanout_key(Key, SubscriberId), Val}.
+fanout_entry(Key, Val) ->
+    {fanout_key(Key, val_subscriber_id(Val)), Val}.
 
 plain_entry(Key, {_FanoutKey, Val}) ->
     {Key, Val}.
 
+%% All rows of a topic key (all shards).
 fanout_entries(Key) ->
-    fanout_entries(Key, 0, fanout_shard_count(), []).
+    ets:select(vmq_trie_subs_fanout, [{{{Key, '_', '_'}, '_'}, [], ['$_']}]).
 
-fanout_entries(_Key, Shard, ShardCount, Acc) when Shard >= ShardCount ->
-    Acc;
-fanout_entries(Key, Shard, ShardCount, Acc) ->
-    fanout_entries(
-        Key, Shard + 1, ShardCount, ets:lookup(vmq_trie_subs_fanout, {Shard, Key}) ++ Acc
-    ).
+%% The rows of one shard of a topic key.
+fanout_shard_entries(Shard, Key) ->
+    ets:select(vmq_trie_subs_fanout, [{{{Key, Shard, '_'}, '_'}, [], ['$_']}]).
 
+%% At most Max rows of a topic key (all shards), without reading the rest.
+fanout_entries_upto(Key, Max) ->
+    case ets:select(vmq_trie_subs_fanout, [{{{Key, '_', '_'}, '_'}, [], ['$_']}], Max) of
+        {Entries, _Cont} -> Entries;
+        '$end_of_table' -> []
+    end.
 del_remote_subscriber(MP, Topic, Node) ->
     Key = {MP, Topic},
     case ets:lookup(vmq_trie_remote_subs, Key) of

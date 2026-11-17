@@ -43,6 +43,8 @@ all() ->
         duplicate_fanout_subscribe_unsubscribe_test,
         queued_sync_update_during_init_test,
         delta_update_subscriber_test,
+        fanout_changed_qos_keeps_one_row_test,
+        fanout_delete_cost_independent_of_topic_size_test,
         reg_view_ready_flags_are_isolated_test
      % bench_vmq_trie
     ].
@@ -96,7 +98,7 @@ sharded_fanout_keeps_all_matches(_Config) ->
                       [])),
         Shards = lists:usort([
             Shard
-         || {{Shard, _Key}, _Val} <- ets:tab2list(vmq_trie_subs_fanout)
+         || {{_Key, Shard, _SubscriberId}, _Val} <- ets:tab2list(vmq_trie_subs_fanout)
         ]),
         true = length(Shards) > 1
     after
@@ -457,6 +459,100 @@ bench_fanout_subs(Num) ->
 
 
 
+fanout_changed_qos_keeps_one_row_test(_Config) ->
+    ok = vmq_test_utils:setup(),
+    try
+        run_fanout_changed_qos_keeps_one_row()
+    after
+        ok = vmq_test_utils:teardown()
+    end.
+
+run_fanout_changed_qos_keeps_one_row() ->
+    MP = "a",
+    Topic = [<<"some">>, <<"#">>],
+    Key = {MP, Topic},
+    Sub1 = {MP, <<"1">>},
+    Sub2 = {MP, <<"2">>},
+    update_subscriber(Sub1, undefined, [{node(), true, [{Topic, 0}]}]),
+    update_subscriber(Sub2, undefined, [{node(), true, [{Topic, 0}]}]),
+    assert_topic_count(Key, 2),
+    %% QoS change delivered as remove + add keeps exactly one row per subscriber.
+    update_subscriber(
+        Sub1, [{node(), true, [{Topic, 0}]}], [{node(), true, [{Topic, 1}]}]
+    ),
+    ?assertEqual(
+        lists:sort([{Key, {Sub1, 1, undefined}}, {Key, {Sub2, 0, undefined}}]),
+        sorted_fanout_entries()
+    ),
+    assert_topic_count(Key, 2),
+    %% An add with a changed QoS and no matching remove replaces the row and
+    %% does not change the subscription count.
+    update_subscriber(Sub2, undefined, [{node(), true, [{Topic, 1}]}]),
+    ?assertEqual(
+        lists:sort([{Key, {Sub1, 1, undefined}}, {Key, {Sub2, 1, undefined}}]),
+        sorted_fanout_entries()
+    ),
+    assert_topic_count(Key, 2),
+    %% A late delete carrying the old QoS must not remove the newer subscription.
+    delete_subscriber(Sub2, [{node(), true, [{Topic, 0}]}]),
+    ?assertEqual(
+        lists:sort([{Key, {Sub1, 1, undefined}}, {Key, {Sub2, 1, undefined}}]),
+        sorted_fanout_entries()
+    ),
+    assert_topic_count(Key, 2),
+    delete_subscriber(Sub1, [{node(), true, [{Topic, 1}]}]),
+    delete_subscriber(Sub2, [{node(), true, [{Topic, 1}]}]),
+    ?assertEqual([], ets:tab2list(vmq_trie_subs)),
+    ?assertEqual([], ets:tab2list(vmq_trie_subs_fanout)),
+    ?assertEqual([], ets:lookup(vmq_trie_topic, Key)),
+    ok.
+
+%% Deleting one subscriber from a fanout topic must not get slower as the topic
+%% grows (the time per delete used to grow with the number of subscribers).
+fanout_delete_cost_independent_of_topic_size_test(_Config) ->
+    application:set_env(vmq_server, fanout_shard_count, 32),
+    try
+        ok = vmq_test_utils:setup(),
+        persistent_term:put({vmq_reg_trie, fanout_shard_count}, 32),
+        Small = delete_time_per_subscriber(2000, 200),
+        Large = delete_time_per_subscriber(40000, 200),
+        ct:pal("delete time per subscriber: 2000 subs ~p us, 40000 subs ~p us", [Small, Large]),
+        %% 20 times more subscribers; linear growth would be a factor of about 20.
+        ?assert(Large < max(Small * 5, 200))
+    after
+        catch vmq_test_utils:teardown(),
+        persistent_term:erase({vmq_reg_trie, fanout_shard_count}),
+        application:unset_env(vmq_server, fanout_shard_count)
+    end,
+    ok.
+
+delete_time_per_subscriber(Total, ToDelete) ->
+    Topic = [{[<<"some">>, <<"big">>, <<"topic">>], 0}],
+    Hour = 1000 * 3600,
+    lists:foreach(
+        fun(I) ->
+            ok = gen_server:call(vmq_reg_trie, {event, updated_event("a", I, Topic)}, Hour)
+        end,
+        lists:seq(1, Total)
+    ),
+    T1 = erlang:monotonic_time(microsecond),
+    lists:foreach(
+        fun(I) ->
+            ok = gen_server:call(vmq_reg_trie, {event, deleted_event("a", I, Topic)}, Hour)
+        end,
+        lists:seq(1, ToDelete)
+    ),
+    T2 = erlang:monotonic_time(microsecond),
+    lists:foreach(
+        fun(I) ->
+            ok = gen_server:call(vmq_reg_trie, {event, deleted_event("a", I, Topic)}, Hour)
+        end,
+        lists:seq(ToDelete + 1, Total)
+    ),
+    [] = ets:tab2list(vmq_trie_subs),
+    [] = ets:tab2list(vmq_trie_subs_fanout),
+    (T2 - T1) div ToDelete.
+
 update_subscriber(SubscriberId, OldSubs, NewSubs) ->
     Event = {updated, {vmq, subscriber}, SubscriberId, OldSubs, NewSubs},
     ok = gen_server:call(vmq_reg_trie, {event, Event}).
@@ -471,7 +567,7 @@ delete_subscriber(SubscriberId, Subs) ->
 sorted_fanout_entries() ->
     lists:sort([
         {Key, Val}
-     || {{_Shard, Key}, Val} <- ets:tab2list(vmq_trie_subs_fanout)
+     || {{Key, _Shard, _SubscriberId}, Val} <- ets:tab2list(vmq_trie_subs_fanout)
     ]).
 
 assert_topic_count(Key, ExpectedTotalCnt) ->
